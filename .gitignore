@@ -10,6 +10,7 @@ __pycache__/
 
 data/raw/*.csv
 data/raw/*.parquet
+data/raw/meteostat_cache/
 !data/raw/.gitkeep
 
 data/processed/*.csv
@@ -24,3 +25,5 @@ outputs/figures/*.pdf
 outputs/tables/*.csv
 outputs/tables/*.xlsx
 !outputs/tables/.gitkeep
+
+.matplotlib/

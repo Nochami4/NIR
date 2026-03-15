@@ -10,17 +10,31 @@ from meteostat import Point, config, daily, hourly, stations
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 from src.constants import (
+    DEFAULT_START_DATE,
     DEFAULT_MIN_HOURLY_OBSERVATIONS,
     FIGURES_DIR,
+    FIXED_DATA_END_DATE,
+    MAX_QUALITY_MIN_YEAR_SHARE,
     MODEL_DATASET_FILENAME,
+    NEURAL_BATCH_SIZE,
+    NEURAL_EPOCHS,
+    NEURAL_PATIENCE,
     OUTPUTS_DIR,
     PROCESSED_DATA_DIR,
     RAW_DAILY_FILENAME,
     RAW_DATA_DIR,
     RAW_HOURLY_FILENAME,
+    RANDOM_STATE,
+    SEASONAL_PERIOD_DAYS,
+    SEQUENCE_WINDOW_DAYS,
     TABLES_DIR,
     TEST_DAYS,
+    TEST_END_DATE,
+    TEST_START_DATE,
+    TRAIN_LENGTH_YEARS,
     VALIDATION_DAYS,
+    VALIDATION_END_DATE,
+    VALIDATION_START_DATE,
     VOLGOGRAD_ELEVATION,
     VOLGOGRAD_LATITUDE,
     VOLGOGRAD_LONGITUDE,
@@ -245,6 +259,23 @@ def load_raw_snapshots() -> tuple[pd.DataFrame, pd.DataFrame]:
     hourly_frame = pd.read_csv(hourly_path, parse_dates=["time", "date"]).set_index("time")
     daily_frame = pd.read_csv(daily_path, parse_dates=["time", "date"]).set_index("time")
     return daily_frame, hourly_frame
+
+
+def subset_raw_snapshots(
+    daily_frame: pd.DataFrame,
+    hourly_frame: pd.DataFrame,
+    start: str | pd.Timestamp,
+    end: str | pd.Timestamp,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Ограничивает raw-данные фиксированным временным интервалом."""
+
+    start_ts = pd.Timestamp(start).normalize()
+    end_ts = pd.Timestamp(end).normalize()
+    hourly_end_ts = end_ts + pd.Timedelta(days=1) - pd.Timedelta(hours=1)
+
+    daily_subset = daily_frame.loc[(daily_frame.index >= start_ts) & (daily_frame.index <= end_ts)].copy()
+    hourly_subset = hourly_frame.loc[(hourly_frame.index >= start_ts) & (hourly_frame.index <= hourly_end_ts)].copy()
+    return daily_subset, hourly_subset
 
 
 def aggregate_hourly_to_daily(hourly: pd.DataFrame) -> pd.DataFrame:
@@ -543,6 +574,12 @@ def get_or_build_modeling_dataset(
         return build_modeling_dataset(start=start, end=end)
     except Exception as exc:
         daily_frame, hourly_frame = load_raw_snapshots()
+        daily_frame, hourly_frame = subset_raw_snapshots(
+            daily_frame=daily_frame,
+            hourly_frame=hourly_frame,
+            start=start,
+            end=end,
+        )
         hourly_daily = aggregate_hourly_to_daily(hourly_frame)
         daily_fallback = prepare_daily_fallback(daily_frame)
         combined = combine_hourly_and_daily_features(hourly_daily=hourly_daily, daily_fallback=daily_fallback)
@@ -603,6 +640,52 @@ def split_train_validation_test(
     return train, validation, test
 
 
+def split_dataset_by_dates(
+    dataset: pd.DataFrame,
+    validation_start: str | pd.Timestamp = VALIDATION_START_DATE,
+    validation_end: str | pd.Timestamp = VALIDATION_END_DATE,
+    test_start: str | pd.Timestamp = TEST_START_DATE,
+    test_end: str | pd.Timestamp = TEST_END_DATE,
+    train_start: str | pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Делит датасет на train, validation и test по фиксированным датам."""
+
+    frame = dataset.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+
+    validation_start_ts = pd.Timestamp(validation_start).normalize()
+    validation_end_ts = pd.Timestamp(validation_end).normalize()
+    test_start_ts = pd.Timestamp(test_start).normalize()
+    test_end_ts = pd.Timestamp(test_end).normalize()
+
+    if train_start is None:
+        train_start_ts = frame["date"].min()
+    else:
+        train_start_ts = pd.Timestamp(train_start).normalize()
+
+    train_end_ts = validation_start_ts - pd.Timedelta(days=1)
+
+    train = frame.loc[(frame["date"] >= train_start_ts) & (frame["date"] <= train_end_ts)].copy()
+    validation = frame.loc[(frame["date"] >= validation_start_ts) & (frame["date"] <= validation_end_ts)].copy()
+    test = frame.loc[(frame["date"] >= test_start_ts) & (frame["date"] <= test_end_ts)].copy()
+
+    if train.empty or validation.empty or test.empty:
+        raise ValueError("Фиксированные интервалы train / validation / test не удалось сформировать.")
+
+    return train.reset_index(drop=True), validation.reset_index(drop=True), test.reset_index(drop=True)
+
+
+def get_interval_summary(frame: pd.DataFrame, label: str) -> dict:
+    """Формирует краткую сводку по временному интервалу."""
+
+    return {
+        "subset": label,
+        "rows": int(len(frame)),
+        "start_date": frame["date"].min().date(),
+        "end_date": frame["date"].max().date(),
+    }
+
+
 def get_model_feature_columns(dataset: pd.DataFrame, exclude_columns: Iterable[str] | None = None) -> list[str]:
     """Возвращает список числовых признаков для моделей."""
 
@@ -618,11 +701,361 @@ def get_model_feature_columns(dataset: pd.DataFrame, exclude_columns: Iterable[s
     return sorted(feature_columns)
 
 
+def get_yearly_coverage(dataset: pd.DataFrame) -> pd.DataFrame:
+    """Оценивает полноту наблюдений по годам."""
+
+    frame = dataset.copy()
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame["year"] = frame["date"].dt.year
+
+    coverage = frame.groupby("year").agg(rows=("date", "size")).reset_index()
+    coverage["days_in_year"] = coverage["year"].apply(
+        lambda year: 366 if pd.Timestamp(f"{year}-12-31").is_leap_year else 365
+    )
+    coverage["share_of_full_year"] = coverage["rows"] / coverage["days_in_year"]
+    return coverage
+
+
+def get_max_quality_train_start(
+    dataset: pd.DataFrame,
+    validation_start: str | pd.Timestamp = VALIDATION_START_DATE,
+    min_year_share: float = MAX_QUALITY_MIN_YEAR_SHARE,
+) -> pd.Timestamp:
+    """Находит самый ранний полный и достаточно качественный год для train."""
+
+    validation_start_ts = pd.Timestamp(validation_start).normalize()
+    coverage = get_yearly_coverage(dataset)
+    eligible_years = coverage.loc[
+        (coverage["year"] < validation_start_ts.year) & (coverage["share_of_full_year"] >= min_year_share),
+        "year",
+    ]
+
+    if eligible_years.empty:
+        return pd.Timestamp(dataset["date"].min()).normalize()
+
+    return pd.Timestamp(f"{int(eligible_years.min())}-01-01")
+
+
+def build_train_scenarios(
+    dataset: pd.DataFrame,
+    validation_start: str | pd.Timestamp = VALIDATION_START_DATE,
+    candidate_lengths_years: Iterable[int] = TRAIN_LENGTH_YEARS,
+) -> list[dict]:
+    """Формирует сценарии с разной длиной train при фиксированных validation и test."""
+
+    validation_start_ts = pd.Timestamp(validation_start).normalize()
+    dataset_start_ts = pd.Timestamp(dataset["date"].min()).normalize()
+    max_quality_start = get_max_quality_train_start(dataset=dataset, validation_start=validation_start_ts)
+
+    scenarios: list[dict] = []
+    for years in candidate_lengths_years:
+        scenario_start = validation_start_ts - pd.DateOffset(years=years)
+        if scenario_start < dataset_start_ts:
+            continue
+        scenarios.append(
+            {
+                "scenario": {
+                    3: "Короткая история",
+                    6: "Средняя история",
+                    10: "Длинная история",
+                }.get(years, f"История {years} лет"),
+                "train_start": scenario_start.normalize(),
+                "train_end": validation_start_ts - pd.Timedelta(days=1),
+                "description": f"История длиной примерно {years} лет",
+            }
+        )
+
+    scenarios.append(
+        {
+            "scenario": "Максимум качественной истории",
+            "train_start": max_quality_start.normalize(),
+            "train_end": validation_start_ts - pd.Timedelta(days=1),
+            "description": "Самая ранняя доступная полная история после проверки годового покрытия",
+        }
+    )
+
+    deduplicated: list[dict] = []
+    seen: set[pd.Timestamp] = set()
+    for scenario in sorted(scenarios, key=lambda item: item["train_start"]):
+        if scenario["train_start"] in seen:
+            continue
+        seen.add(scenario["train_start"])
+        deduplicated.append(scenario)
+
+    return deduplicated
+
+
+def build_tabular_modeling_frame(dataset: pd.DataFrame) -> tuple[pd.DataFrame, list[str], list[str]]:
+    """Готовит табличный датасет для baseline, ML и Dense-сети."""
+
+    frame = dataset.copy().sort_values("date").reset_index(drop=True)
+
+    weather_columns = [
+        column
+        for column in [
+            "tmin",
+            "tmax",
+            "temp_range",
+            "prcp_sum",
+            "snow",
+            "pres_mean",
+            "wspd_mean",
+            "wpgt_max",
+            "rhum_mean",
+            "dwpt_mean",
+            "tsun_sum",
+        ]
+        if column in frame.columns
+    ]
+
+    for column in weather_columns:
+        frame[f"{column}_lag1"] = frame[column].shift(1)
+
+    calendar_columns = [
+        column
+        for column in ["month", "dayofyear", "dayofweek", "season_code", "doy_sin", "doy_cos"]
+        if column in frame.columns
+    ]
+    history_columns = [
+        column
+        for column in [
+            "lag_1",
+            "lag_2",
+            "lag_3",
+            "lag_7",
+            "lag_14",
+            "lag_30",
+            "rolling_mean_3",
+            "rolling_mean_7",
+            "rolling_mean_14",
+            "rolling_std_7",
+            "rolling_std_14",
+        ]
+        if column in frame.columns
+    ]
+    lagged_weather_columns = [f"{column}_lag1" for column in weather_columns if f"{column}_lag1" in frame.columns]
+
+    feature_columns = calendar_columns + history_columns + lagged_weather_columns
+    frame = frame.dropna(subset=feature_columns + ["target_tavg"]).reset_index(drop=True)
+    return frame, feature_columns, weather_columns
+
+
+def build_sequence_features(dataset: pd.DataFrame) -> list[str]:
+    """Возвращает набор признаков для последовательностных нейросетей."""
+
+    return [
+        column
+        for column in [
+            "target_tavg",
+            "tmin",
+            "tmax",
+            "temp_range",
+            "prcp_sum",
+            "snow",
+            "pres_mean",
+            "wspd_mean",
+            "rhum_mean",
+            "doy_sin",
+            "doy_cos",
+        ]
+        if column in dataset.columns
+    ]
+
+
+def create_sequence_windows(
+    dataset: pd.DataFrame,
+    feature_columns: list[str],
+    window_size: int = SEQUENCE_WINDOW_DAYS,
+) -> tuple[np.ndarray, np.ndarray, pd.Series]:
+    """Формирует окна временных последовательностей для LSTM/GRU/Conv1D."""
+
+    frame = dataset.copy().sort_values("date").reset_index(drop=True)
+    values = frame[feature_columns].to_numpy(dtype=float)
+    targets = frame["target_tavg"].to_numpy(dtype=float)
+    dates = pd.to_datetime(frame["date"])
+
+    windows: list[np.ndarray] = []
+    window_targets: list[float] = []
+    window_dates: list[pd.Timestamp] = []
+
+    for idx in range(window_size, len(frame)):
+        windows.append(values[idx - window_size : idx])
+        window_targets.append(targets[idx])
+        window_dates.append(dates.iloc[idx])
+
+    return np.asarray(windows, dtype=float), np.asarray(window_targets, dtype=float), pd.Series(window_dates, name="date")
+
+
+def split_sequence_windows_by_dates(
+    windows: np.ndarray,
+    targets: np.ndarray,
+    target_dates: pd.Series,
+    train_start: str | pd.Timestamp,
+    validation_start: str | pd.Timestamp = VALIDATION_START_DATE,
+    validation_end: str | pd.Timestamp = VALIDATION_END_DATE,
+    test_start: str | pd.Timestamp = TEST_START_DATE,
+    test_end: str | pd.Timestamp = TEST_END_DATE,
+) -> dict[str, np.ndarray | pd.Series]:
+    """Делит последовательностные окна по тем же фиксированным датам."""
+
+    date_index = pd.to_datetime(target_dates)
+    train_start_ts = pd.Timestamp(train_start).normalize()
+    validation_start_ts = pd.Timestamp(validation_start).normalize()
+    validation_end_ts = pd.Timestamp(validation_end).normalize()
+    test_start_ts = pd.Timestamp(test_start).normalize()
+    test_end_ts = pd.Timestamp(test_end).normalize()
+
+    train_mask = (date_index >= train_start_ts) & (date_index < validation_start_ts)
+    validation_mask = (date_index >= validation_start_ts) & (date_index <= validation_end_ts)
+    test_mask = (date_index >= test_start_ts) & (date_index <= test_end_ts)
+
+    return {
+        "X_train": windows[train_mask],
+        "y_train": targets[train_mask],
+        "dates_train": date_index[train_mask].reset_index(drop=True),
+        "X_validation": windows[validation_mask],
+        "y_validation": targets[validation_mask],
+        "dates_validation": date_index[validation_mask].reset_index(drop=True),
+        "X_test": windows[test_mask],
+        "y_test": targets[test_mask],
+        "dates_test": date_index[test_mask].reset_index(drop=True),
+    }
+
+
+def calculate_mase(
+    y_true: pd.Series | np.ndarray,
+    y_pred: pd.Series | np.ndarray,
+    insample: pd.Series | np.ndarray,
+    seasonality: int = SEASONAL_PERIOD_DAYS,
+) -> float:
+    """Вычисляет MASE относительно сезонного наивного масштаба."""
+
+    y_true_array = np.asarray(y_true, dtype=float)
+    y_pred_array = np.asarray(y_pred, dtype=float)
+    insample_array = np.asarray(insample, dtype=float)
+
+    valid_mask = np.isfinite(y_true_array) & np.isfinite(y_pred_array)
+    y_true_array = y_true_array[valid_mask]
+    y_pred_array = y_pred_array[valid_mask]
+    insample_array = insample_array[np.isfinite(insample_array)]
+
+    effective_seasonality = seasonality if len(insample_array) > seasonality else 1
+    naive_errors = np.abs(insample_array[effective_seasonality:] - insample_array[:-effective_seasonality])
+
+    scale = float(np.mean(naive_errors)) if len(naive_errors) > 0 else np.nan
+    if np.isnan(scale) or scale == 0:
+        return float("nan")
+
+    return float(np.mean(np.abs(y_true_array - y_pred_array)) / scale)
+
+
+def seasonal_naive_forecast(
+    target_dates: pd.Series | pd.DatetimeIndex,
+    full_series: pd.Series,
+) -> pd.Series:
+    """Строит seasonal naive прогноз по значению примерно того же дня прошлого года."""
+
+    history = full_series.copy()
+    history.index = pd.to_datetime(history.index)
+    target_index = pd.to_datetime(target_dates)
+
+    predictions: list[float] = []
+    for current_date in target_index:
+        candidate_dates = [current_date - pd.DateOffset(years=1)]
+
+        if current_date.month == 2 and current_date.day == 29:
+            candidate_dates.append(pd.Timestamp(year=current_date.year - 1, month=2, day=28))
+
+        candidate_dates.extend(
+            [
+                current_date - pd.DateOffset(years=1) - pd.Timedelta(days=1),
+                current_date - pd.DateOffset(years=1) + pd.Timedelta(days=1),
+            ]
+        )
+
+        prediction_value = np.nan
+        for candidate_date in candidate_dates:
+            normalized_candidate = pd.Timestamp(candidate_date).normalize()
+            if normalized_candidate in history.index:
+                prediction_value = float(history.loc[normalized_candidate])
+                break
+
+        predictions.append(prediction_value)
+
+    return pd.Series(predictions, index=target_index, name="seasonal_naive")
+
+
+def evaluate_forecast(
+    y_true: pd.Series | np.ndarray,
+    y_pred: pd.Series | np.ndarray,
+    model_name: str,
+    insample: pd.Series | np.ndarray,
+    seasonality: int = SEASONAL_PERIOD_DAYS,
+) -> dict:
+    """Считает набор метрик прогноза, включая MASE."""
+
+    base_metrics = evaluate_regression(y_true=y_true, y_pred=y_pred, model_name=model_name)
+    base_metrics["mase"] = calculate_mase(
+        y_true=y_true,
+        y_pred=y_pred,
+        insample=insample,
+        seasonality=seasonality,
+    )
+    return base_metrics
+
+
+def set_global_seed(seed: int = RANDOM_STATE) -> None:
+    """Фиксирует основные генераторы случайных чисел."""
+
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    try:
+        import tensorflow as tf
+
+        tf.keras.utils.set_random_seed(seed)
+    except Exception:
+        pass
+
+
+def get_default_runtime_config() -> dict:
+    """Возвращает базовую конфигурацию экспериментов."""
+
+    return {
+        "data_start_date": pd.Timestamp(DEFAULT_START_DATE),
+        "data_end_date": pd.Timestamp(FIXED_DATA_END_DATE),
+        "validation_start_date": pd.Timestamp(VALIDATION_START_DATE),
+        "validation_end_date": pd.Timestamp(VALIDATION_END_DATE),
+        "test_start_date": pd.Timestamp(TEST_START_DATE),
+        "test_end_date": pd.Timestamp(TEST_END_DATE),
+        "seasonal_period_days": SEASONAL_PERIOD_DAYS,
+        "sequence_window_days": SEQUENCE_WINDOW_DAYS,
+        "neural_epochs": NEURAL_EPOCHS,
+        "neural_patience": NEURAL_PATIENCE,
+        "neural_batch_size": NEURAL_BATCH_SIZE,
+        "random_state": RANDOM_STATE,
+    }
+
+
 def evaluate_regression(y_true: pd.Series, y_pred: pd.Series | np.ndarray, model_name: str) -> dict:
     """Вычисляет основные метрики регрессии."""
 
     y_true_array = np.asarray(y_true, dtype=float)
     y_pred_array = np.asarray(y_pred, dtype=float)
+    valid_mask = np.isfinite(y_true_array) & np.isfinite(y_pred_array)
+
+    if not np.any(valid_mask):
+        return {
+            "model": model_name,
+            "mae": float("nan"),
+            "rmse": float("nan"),
+            "bias": float("nan"),
+        }
+
+    y_true_array = y_true_array[valid_mask]
+    y_pred_array = y_pred_array[valid_mask]
 
     return {
         "model": model_name,
