@@ -1,0 +1,25 @@
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_ROOT / "data"
+RAW_DATA_DIR = DATA_DIR / "raw"
+PROCESSED_DATA_DIR = DATA_DIR / "processed"
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+FIGURES_DIR = OUTPUTS_DIR / "figures"
+TABLES_DIR = OUTPUTS_DIR / "tables"
+
+VOLGOGRAD_NAME = "Волгоград"
+VOLGOGRAD_LATITUDE = 48.7080
+VOLGOGRAD_LONGITUDE = 44.5133
+VOLGOGRAD_ELEVATION = 50
+
+DEFAULT_START_DATE = "2010-01-01"
+MODEL_DATASET_FILENAME = "volgograd_daily_temperature_dataset.csv"
+RAW_HOURLY_FILENAME = "volgograd_hourly_raw.csv"
+RAW_DAILY_FILENAME = "volgograd_daily_raw.csv"
+
+DEFAULT_MIN_HOURLY_OBSERVATIONS = 18
+RANDOM_STATE = 42
+VALIDATION_DAYS = 365
+TEST_DAYS = 365
